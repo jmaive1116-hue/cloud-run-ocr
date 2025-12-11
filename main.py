@@ -102,7 +102,7 @@ def save_blocks_to_gcs(bucket_name, output_path, blocks):
 # -----------------------------------------------
 def run_batch_ocr():
     PROJECT_ID = os.environ["GeoTech-Research-Assistant"]
-    LOCATION = os.environ.get("Geotech_Paper_OCR_Processor", "us")
+    LOCATION = os.environ.get("us")
     PROCESSOR_ID = os.environ["Geotech_Paper_OCR_Processor"]
     INPUT_BUCKET = os.environ["geotech-papers-jinghu"]
     OUTPUT_BUCKET = os.environ["geotech-papers-jinghu-output"]
@@ -151,3 +151,4 @@ def run_batch():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
