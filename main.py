@@ -51,17 +51,21 @@ def process_document_ai(project_id, location, processor_id, gcs_input_uri):
     client = documentai.DocumentProcessorServiceClient()
     name = client.processor_path(project_id, location, processor_id)
 
+    # 正确格式：gcs_document
+    gcs_document = documentai.GcsDocument(
+        gcs_uri=gcs_input_uri,
+        mime_type="application/pdf"
+    )
+
+    # 正确格式：raw_document 与 gcs_document 只能选一个
+    document = documentai.Document(
+        gcs_document=gcs_document
+    )
+
     request = documentai.ProcessRequest(
         name=name,
         skip_human_review=True,
-        input_documents=documentai.BatchDocumentsInputConfig(
-            gcs_documents=documentai.GcsDocuments(documents=[
-                documentai.GcsDocument(
-                    gcs_uri=gcs_input_uri,
-                    mime_type="application/pdf"
-                )
-            ])
-        )
+        document=document
     )
 
     result = client.process_document(request=request)
@@ -151,5 +155,6 @@ def run_batch():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
