@@ -1,160 +1,110 @@
 import os
 import json
-from flask import Flask, request, jsonify
+import time
+from flask import Flask, jsonify, request
 from google.cloud import storage, documentai_v1 as documentai
 
+# 初始化 Flask 应用
 app = Flask(__name__)
 
 # -----------------------------------------------
-# 文本块提取函数
+# 配置信息 (从环境变量中获取，确保 Cloud Run 部署时设置了这些变量)
 # -----------------------------------------------
-def extract_text_blocks(doc):
-    """从 Document AI 返回结果中提取文本块，保留结构化信息"""
-    text = doc.text
-    blocks_output = []
-
-    for page in doc.pages:
-        # 1. blocks
-        for block in page.blocks:
-            block_text = ""
-            for segment in block.layout.text_anchor.text_segments:
-                start = segment.start_index or 0
-                end = segment.end_index
-                block_text += text[start:end]
-
-            blocks_output.append({
-                "type": "block",
-                "page": page.page_number,
-                "text": block_text.strip()
-            })
-
-        # 2. paragraphs
-        for para in page.paragraphs:
-            para_text = ""
-            for segment in para.layout.text_anchor.text_segments:
-                start = segment.start_index or 0
-                end = segment.end_index
-                para_text += text[start:end]
-
-            blocks_output.append({
-                "type": "paragraph",
-                "page": page.page_number,
-                "text": para_text.strip()
-            })
-
-    return blocks_output
-
-# -----------------------------------------------
-# 调用 Document AI OCR
-# -----------------------------------------------
-def process_document_ai(project_id, location, processor_id, gcs_input_uri):
-    client = documentai.DocumentProcessorServiceClient()
-    name = client.processor_path(project_id, location, processor_id)
-
-    # 正确格式：gcs_document
-    gcs_document = documentai.GcsDocument(
-        gcs_uri=gcs_input_uri,
-        mime_type="application/pdf"
-    )
-
-    # 正确格式：raw_document 与 gcs_document 只能选一个
-    document = documentai.Document(
-        gcs_document=gcs_document
-    )
-
-    request = documentai.ProcessRequest(
-        name=name,
-        skip_human_review=True,
-        document=document
-    )
-
-    result = client.process_document(request=request)
-    blocks = extract_text_blocks(result.document)
-    return blocks
-
-# -----------------------------------------------
-# 列出 GCS bucket 下所有 PDF
-# -----------------------------------------------
-def list_pdfs_in_gcs(bucket_name, prefix=""):
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blobs = bucket.list_blobs(prefix=prefix)
-
-    pdf_files = [
-        f"gs://{bucket_name}/{blob.name}"
-        for blob in blobs
-        if blob.name.lower().endswith(".pdf")
-    ]
-
-    return pdf_files
-
-# -----------------------------------------------
-# 保存 JSON 到 GCS
-# -----------------------------------------------
-def save_blocks_to_gcs(bucket_name, output_path, blocks):
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(output_path)
-
-    blob.upload_from_string(
-        json.dumps(blocks, ensure_ascii=False, indent=2),
-        content_type="application/json"
-    )
-
-# -----------------------------------------------
-# 批处理函数
-# -----------------------------------------------
-def run_batch_ocr():
-    # 必须使用环境变量名，而不是项目名/桶名
+try:
     PROJECT_ID = os.environ["PROJECT_ID"]
-    LOCATION = os.environ["PROCESSOR_LOCATION"]
+    LOCATION = os.environ["PROCESSOR_LOCATION"]  # 例如: "us" 或 "eu"
     PROCESSOR_ID = os.environ["PROCESSOR_ID"]
     INPUT_BUCKET = os.environ["INPUT_BUCKET"]
     OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
-    INPUT_PREFIX = os.environ.get("INPUT_PREFIX", "")
+    INPUT_PREFIX = os.environ.get("INPUT_PREFIX", "") # 可选：如 "papers/"
+    # 默认的输出路径前缀
+    OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "doc_ai_batch_output/")
+except KeyError as e:
+    print(f"Error: Missing required environment variable: {e}")
+    # 在生产环境中，这应该导致容器启动失败
+    PROJECT_ID, LOCATION, PROCESSOR_ID, INPUT_BUCKET, OUTPUT_BUCKET = "", "", "", "", ""
 
-    pdf_files = list_pdfs_in_gcs(INPUT_BUCKET, INPUT_PREFIX)
-    results = []
 
-    for gcs_uri in pdf_files:
-        print(f"Processing {gcs_uri}")
-        try:
-            blocks = process_document_ai(PROJECT_ID, LOCATION, PROCESSOR_ID, gcs_uri)
-            filename = gcs_uri.split("/")[-1].replace(".pdf", ".json")
-            output_path = f"ocr_results/{filename}"
-            save_blocks_to_gcs(OUTPUT_BUCKET, output_path, blocks)
-            results.append({
-                "input": gcs_uri,
-                "output": f"gs://{OUTPUT_BUCKET}/{output_path}",
-                "status": "success"
-            })
-        except Exception as e:
-            print(f"Error processing {gcs_uri}: {e}")
-            results.append({
-                "input": gcs_uri,
-                "error": str(e),
-                "status": "failed"
-            })
+# -----------------------------------------------
+# Document AI 异步批量处理核心函数
+# -----------------------------------------------
+def run_batch_document_ai_async():
+    """
+    启动 Document AI 批量处理任务，对 GCS 输入路径下的所有 PDF 文件进行 OCR。
+    """
+    if not all([PROJECT_ID, LOCATION, PROCESSOR_ID, INPUT_BUCKET, OUTPUT_BUCKET]):
+        raise EnvironmentError("One or more required environment variables are not set.")
 
-    return results
+    # 构造 GCS 路径
+    gcs_input_prefix = f"gs://{INPUT_BUCKET}/{INPUT_PREFIX}"
+    gcs_output_prefix = f"gs://{OUTPUT_BUCKET}/{OUTPUT_PREFIX}"
+    
+    # 初始化 Document AI 客户端
+    client = documentai.DocumentProcessorServiceClient()
+    name = client.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
+
+    # 1. 设置输入配置：指向 GCS 前缀，处理所有 PDF
+    input_config = documentai.BatchProcessRequest.BatchInputConfig(
+        gcs_prefix=gcs_input_prefix, 
+        mime_type="application/pdf"
+    )
+
+    # 2. 设置输出配置：Document AI 将把结果写入此路径
+    output_config = documentai.BatchProcessRequest.BatchOutputConfig(
+        gcs_output_uri=gcs_output_prefix
+    )
+
+    request = documentai.BatchProcessRequest(
+        name=name,
+        input_documents=input_config,
+        document_output_config=output_config
+    )
+
+    # 3. 异步调用批量处理 API (返回 Long Running Operation)
+    # 任务将在 Google Cloud 后台运行，不占用 Cloud Run 资源
+    operation = client.batch_process_documents(request=request)
+
+    print(f"Batch processing started. Operation name: {operation.operation.name}")
+    
+    return operation.operation.name, gcs_output_prefix
+
 # -----------------------------------------------
 # HTTP 端点
 # -----------------------------------------------
+
 @app.route("/", methods=["GET"])
 def health_check():
-    return "Batch OCR service is running.", 200
+    """用于 Cloud Run 健康检查"""
+    return "Batch Document AI Service is ready.", 200
 
 @app.route("/run-batch", methods=["GET", "POST"])
 def run_batch():
-    results = run_batch_ocr()
-    return jsonify({"processed": results})
+    """
+    触发异步 Document AI 批量处理任务。
+    """
+    try:
+        operation_name, output_path = run_batch_document_ai_async()
+        
+        # 返回 202 Accepted，表示任务已接受并在后台处理
+        return jsonify({
+            "status": "Batch processing accepted and running asynchronously.",
+            "operation_name": operation_name,
+            "input_path": f"gs://{INPUT_BUCKET}/{INPUT_PREFIX}",
+            "output_path": output_path,
+            "monitor_url": f"https://console.cloud.google.com/operations/detail/{operation_name.split('/')[-1]}?project={PROJECT_ID}"
+        }), 202
+
+    except EnvironmentError as e:
+        return jsonify({"error": str(e), "message": "Check Cloud Run environment variables."}), 500
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        return jsonify({"error": "Failed to start batch process.", "details": str(e)}), 500
+
 
 # -----------------------------------------------
 # Cloud Run 启动入口
 # -----------------------------------------------
 if __name__ == "__main__":
+    # Cloud Run 通常使用 Gunicorn 或 uWSGI 启动，但对于本地测试，使用 app.run
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
-
-
