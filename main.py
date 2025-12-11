@@ -101,11 +101,12 @@ def save_blocks_to_gcs(bucket_name, output_path, blocks):
 # 批处理函数
 # -----------------------------------------------
 def run_batch_ocr():
-    PROJECT_ID = os.environ["GeoTech-Research-Assistant"]
-    LOCATION = os.environ.get("us")
-    PROCESSOR_ID = os.environ["Geotech_Paper_OCR_Processor"]
-    INPUT_BUCKET = os.environ["geotech-papers-jinghu"]
-    OUTPUT_BUCKET = os.environ["geotech-papers-jinghu-output"]
+    # 必须使用环境变量名，而不是项目名/桶名
+    PROJECT_ID = os.environ["PROJECT_ID"]
+    LOCATION = os.environ["PROCESSOR_LOCATION"]
+    PROCESSOR_ID = os.environ["PROCESSOR_ID"]
+    INPUT_BUCKET = os.environ["INPUT_BUCKET"]
+    OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
     INPUT_PREFIX = os.environ.get("INPUT_PREFIX", "")
 
     pdf_files = list_pdfs_in_gcs(INPUT_BUCKET, INPUT_PREFIX)
@@ -132,7 +133,6 @@ def run_batch_ocr():
             })
 
     return results
-
 # -----------------------------------------------
 # HTTP 端点
 # -----------------------------------------------
@@ -151,4 +151,5 @@ def run_batch():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
