@@ -1,52 +1,153 @@
+import os
+import json
+from flask import Flask, request, jsonify
 from google.cloud import storage, documentai_v1 as documentai
-from flask import Flask
 
 app = Flask(__name__)
 
-@app.route("/")
-def run_ocr_batch():
-    project_id = "GeoTech-Research-Assistant"
-    location = "us"   # 通常用 us
-    processor_id = "Geotech_Paper_OCR_Processor"
-    bucket_name = "geotech-papers-jinghu"
-    input_prefix = "papers/"      # 要处理的 PDF 存放目录
-    output_prefix = "ocr_output/" # OCR 输出目录
+# -----------------------------------------------
+# 文本块提取函数
+# -----------------------------------------------
+def extract_text_blocks(doc):
+    """从 Document AI 返回结果中提取文本块，保留结构化信息"""
+    text = doc.text
+    blocks_output = []
 
-    docai_client = documentai.DocumentProcessorServiceClient()
-    storage_client = storage.Client()
+    for page in doc.pages:
+        # 1. blocks
+        for block in page.blocks:
+            block_text = ""
+            for segment in block.layout.text_anchor.text_segments:
+                start = segment.start_index or 0
+                end = segment.end_index
+                block_text += text[start:end]
 
-    name = docai_client.processor_path(project_id, location, processor_id)
-    bucket = storage_client.bucket(bucket_name)
+            blocks_output.append({
+                "type": "block",
+                "page": page.page_number,
+                "text": block_text.strip()
+            })
 
-    # 自动列出所有 PDF 文件
-    pdf_files = [
-        documentai.GcsDocument(
-            gcs_uri=f"gs://{bucket_name}/{blob.name}",
-            mime_type="application/pdf"
+        # 2. paragraphs
+        for para in page.paragraphs:
+            para_text = ""
+            for segment in para.layout.text_anchor.text_segments:
+                start = segment.start_index or 0
+                end = segment.end_index
+                para_text += text[start:end]
+
+            blocks_output.append({
+                "type": "paragraph",
+                "page": page.page_number,
+                "text": para_text.strip()
+            })
+
+    return blocks_output
+
+# -----------------------------------------------
+# 调用 Document AI OCR
+# -----------------------------------------------
+def process_document_ai(project_id, location, processor_id, gcs_input_uri):
+    client = documentai.DocumentProcessorServiceClient()
+    name = client.processor_path(project_id, location, processor_id)
+
+    request = documentai.ProcessRequest(
+        name=name,
+        skip_human_review=True,
+        input_documents=documentai.BatchDocumentsInputConfig(
+            gcs_documents=documentai.GcsDocuments(documents=[
+                documentai.GcsDocument(
+                    gcs_uri=gcs_input_uri,
+                    mime_type="application/pdf"
+                )
+            ])
         )
-        for blob in bucket.list_blobs(prefix=input_prefix)
-        if blob.name.endswith(".pdf")
+    )
+
+    result = client.process_document(request=request)
+    blocks = extract_text_blocks(result.document)
+    return blocks
+
+# -----------------------------------------------
+# 列出 GCS bucket 下所有 PDF
+# -----------------------------------------------
+def list_pdfs_in_gcs(bucket_name, prefix=""):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=prefix)
+
+    pdf_files = [
+        f"gs://{bucket_name}/{blob.name}"
+        for blob in blobs
+        if blob.name.lower().endswith(".pdf")
     ]
 
-    if not pdf_files:
-        return "No PDF found."
+    return pdf_files
 
-    input_docs = documentai.GcsDocuments(documents=pdf_files)
-    input_config = documentai.BatchDocumentsInputConfig(gcs_documents=input_docs)
+# -----------------------------------------------
+# 保存 JSON 到 GCS
+# -----------------------------------------------
+def save_blocks_to_gcs(bucket_name, output_path, blocks):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(output_path)
 
-    output_config = documentai.DocumentOutputConfig(
-        gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(
-            gcs_uri=f"gs://{bucket_name}/{output_prefix}"
-        )
+    blob.upload_from_string(
+        json.dumps(blocks, ensure_ascii=False, indent=2),
+        content_type="application/json"
     )
 
-    request = documentai.BatchProcessRequest(
-        name=name,
-        input_documents=input_config,
-        document_output_config=output_config,
-    )
+# -----------------------------------------------
+# 批处理函数
+# -----------------------------------------------
+def run_batch_ocr():
+    PROJECT_ID = os.environ["GeoTech-Research-Assistant"]
+    LOCATION = os.environ.get("Geotech_Paper_OCR_Processor", "us")
+    PROCESSOR_ID = os.environ["Geotech_Paper_OCR_Processor"]
+    INPUT_BUCKET = os.environ["geotech-papers-jinghu"]
+    OUTPUT_BUCKET = os.environ["geotech-papers-jinghu-output"]
+    INPUT_PREFIX = os.environ.get("INPUT_PREFIX", "")
 
-    op = docai_client.batch_process_documents(request)
-    op.result()
+    pdf_files = list_pdfs_in_gcs(INPUT_BUCKET, INPUT_PREFIX)
+    results = []
 
-    return f"OCR completed. Output in gs://{bucket_name}/{output_prefix}"
+    for gcs_uri in pdf_files:
+        print(f"Processing {gcs_uri}")
+        try:
+            blocks = process_document_ai(PROJECT_ID, LOCATION, PROCESSOR_ID, gcs_uri)
+            filename = gcs_uri.split("/")[-1].replace(".pdf", ".json")
+            output_path = f"ocr_results/{filename}"
+            save_blocks_to_gcs(OUTPUT_BUCKET, output_path, blocks)
+            results.append({
+                "input": gcs_uri,
+                "output": f"gs://{OUTPUT_BUCKET}/{output_path}",
+                "status": "success"
+            })
+        except Exception as e:
+            print(f"Error processing {gcs_uri}: {e}")
+            results.append({
+                "input": gcs_uri,
+                "error": str(e),
+                "status": "failed"
+            })
+
+    return results
+
+# -----------------------------------------------
+# HTTP 端点
+# -----------------------------------------------
+@app.route("/", methods=["GET"])
+def health_check():
+    return "Batch OCR service is running.", 200
+
+@app.route("/run-batch", methods=["GET", "POST"])
+def run_batch():
+    results = run_batch_ocr()
+    return jsonify({"processed": results})
+
+# -----------------------------------------------
+# Cloud Run 启动入口
+# -----------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
